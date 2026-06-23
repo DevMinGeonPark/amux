@@ -45,24 +45,43 @@ shell_file() {
 }
 
 RC="$(detect_rc)"; SRC="$(shell_file)"
-LINE="source \"$SRC\"   # amux"
+MARK_START='# >>> amux >>>'
+MARK_END='# <<< amux <<<'
+
+# Append a self-contained managed block to the shell rc: PATH (if missing),
+# optional SSH auto-picker, and `source` of the integration file (completion).
+write_block() {
+  local ssh_menu="$1"
+  {
+    printf '\n%s  (managed by amux install.sh)\n' "$MARK_START"
+    case ":$PATH:" in *":$BINDIR:"*) : ;; *) printf 'export PATH="%s:$PATH"\n' "$BINDIR" ;; esac
+    [ "$ssh_menu" = 1 ] && printf 'export AMUX_SSH_MENU=1   # auto-open the picker on SSH logins (outside tmux)\n'
+    printf 'source "%s"\n' "$SRC"
+    printf '%s\n' "$MARK_END"
+  } >> "$RC"
+}
 
 if [ -n "$RC" ] && [ -n "$SRC" ]; then
-  if [ -f "$RC" ] && grep -qF "$SRC" "$RC" 2>/dev/null; then
+  if [ -f "$RC" ] && grep -qF "$MARK_START" "$RC" 2>/dev/null; then
     ok "shell integration already present in $RC"
+  elif [ -t 0 ]; then
+    printf '   Add amux to %s (PATH + tab-completion)? [Y/n] ' "$RC"
+    read -r ans
+    case "$ans" in
+      n|N|no) say "skipped — run amux by full path, or add $BINDIR to PATH yourself." ;;
+      *)
+        ssh=0
+        printf '   Also auto-open the picker on SSH logins (outside tmux)? [y/N] '
+        read -r a2; case "$a2" in y|Y|yes) ssh=1 ;; esac
+        write_block "$ssh"
+        ok "added to $RC — restart your shell or: source \"$RC\""
+        [ "$ssh" = 1 ] && say "SSH auto-picker enabled — new SSH logins drop into the picker." ;;
+    esac
   else
-    say "Optional shell integration (completion + optional SSH menu):"
-    printf '      %s\n' "$LINE"
-    if [ -t 0 ]; then
-      printf '   Add it to %s now? [y/N] ' "$RC"
-      read -r ans
-      case "$ans" in
-        y|Y|yes)
-          printf '\n# amux shell integration\n%s\n' "$LINE" >> "$RC"
-          ok "added to $RC — restart your shell or: source \"$RC\"" ;;
-        *) say "skipped — add the line above whenever you like." ;;
-      esac
-    fi
+    warn "non-interactive — add this to $RC to finish setup:"
+    printf '      export PATH="%s:$PATH"\n' "$BINDIR"
+    printf '      export AMUX_SSH_MENU=1   # optional: auto-open picker on SSH login\n'
+    printf '      source "%s"\n' "$SRC"
   fi
 fi
 

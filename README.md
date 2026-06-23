@@ -62,7 +62,13 @@ cd amux
 ./install.sh          # installs to ~/.local/bin, offers shell integration
 ```
 
-Or just put `bin/amux` anywhere on your `PATH`.
+`install.sh` copies the binary, then (if you say yes) adds a small managed
+block to your shell rc that puts `~/.local/bin` on `PATH` and enables
+tab-completion. It also asks whether to **auto-open the picker on SSH logins**
+(handy on a remote/headless box) — answer `y` to enable it. Re-running the
+installer is safe; the block is updated in place, not duplicated.
+
+Or just put `bin/amux` anywhere on your `PATH` and skip the shell integration.
 
 ## Usage
 
