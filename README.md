@@ -1,5 +1,7 @@
 # amux
 
+**English** · [한국어](README.ko.md)
+
 **Agent-aware tmux session manager.** See every tmux session at a glance —
 what it's running (Claude Code / Codex / shell), and whether it's *working*,
 *waiting for you*, or has gone *idle* — with a live fzf picker, a real-screen
@@ -7,6 +9,8 @@ preview, and a full-screen dashboard.
 
 Built for juggling many AI coding-agent sessions at once (especially on a
 remote/headless box). Pure Bash + tmux; works on macOS (bash 3.2) and Linux.
+
+![amux demo](docs/demo.gif)
 
 ```
  ⬢ tmux sessions   8 sessions
