@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/banner.ko.png" alt="amux — 에이전트 인식 tmux 세션 매니저" width="860">
+</p>
+
 # amux
 
 [English](README.md) · **한국어**

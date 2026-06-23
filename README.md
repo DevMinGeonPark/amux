@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/banner.en.png" alt="amux — agent-aware tmux session manager" width="860">
+</p>
+
 # amux
 
 **English** · [한국어](README.ko.md)
