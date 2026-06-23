@@ -1,0 +1,674 @@
+#!/bin/bash
+# amux — agent-aware tmux session manager.
+#
+# Lists/attaches tmux sessions grouped by a "tag/name" prefix, and annotates
+# each with what it is running (Claude Code / Codex / shell / …) and its live
+# status: working, needs-you, asking, typing, idle, dormant.  Ships a live
+# fzf picker (with a real-screen preview) and a full-screen dashboard.
+#
+# Pure bash (works with macOS bash 3.2) + tmux.  fzf and curl are optional but
+# recommended.  See `amux --help`.  Project: https://github.com/DevMinGeonPark/amux
+
+TMUX_CMD=(tmux -u)
+TAB=$'\t'
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+# ---- configuration (env vars) ----------------------------------------------
+#   AMUX_LANG           en | ko          (default: auto from locale)
+#   AMUX_DORMANT_DAYS   idle→dormant after N days of no chat output (default 3)
+#   AMUX_WATCH_INTERVAL dashboard refresh seconds (default 2)
+#   AMUX_PICK_INTERVAL  picker preview refresh seconds (default 2)
+#   AMUX_DIR_ROOTS      ':'-separated dirs scanned when picking a start folder
+#                       (default: $HOME)
+amux_default_lang() {
+  case "${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}" in
+    ko*|*_KR*) printf ko ;;
+    *)         printf en ;;
+  esac
+}
+AMUX_LANG="${AMUX_LANG:-$(amux_default_lang)}"
+
+# ---- i18n -------------------------------------------------------------------
+# All user-facing strings live here.  load_strings sets S_* globals once.
+load_strings() {
+  if [ "$AMUX_LANG" = ko ]; then
+    S_WORKING='작업중'; S_NEEDS='응답 필요'; S_ASKING='질문함'; S_TYPING='입력중'
+    S_IDLE='대기';     S_DORMANT='유휴';   S_SHELL='shell';   S_OTHER='기타'
+    S_TITLE='tmux 세션'; S_NONE='세션 없음'; S_WATCH='주목'
+    S_NEWSESS='새 세션'; S_NEWSHELL='새 셸'
+    S_WIN='창'; S_ATTACHED='연결됨'; S_DETACHED='분리됨'
+    S_REFRESH='갱신'; S_QUIT='Ctrl-C 종료'
+    S_KEYS='⏎ 접속   ^n 새 세션   ^t 태그변경   ^x 종료   ^r 새로고침'
+    S_BORDER=' ⬢ tmux 세션 '; S_PREVIEW=' 미리보기 '
+    S_TAG_HEADER='태그 선택 또는 새로 입력 (필수)'; S_TAG_PROMPT='태그(필수): '
+    S_DIR_HEADER='시작 폴더 선택 (Esc → 홈)';       S_DIR_PROMPT='폴더 [~]: '
+    S_NAME_PROMPT=' 세션 이름 [main]: '
+    S_LAUNCH_PROMPT='실행  [1] claude  [2] codex  [3] shell  (기본 1): '
+    S_NEW_DESC=$'  ＋ 새 세션 만들기\n\n  Enter → 태그 · 이름 · 도구(claude/codex/shell)\n  · 시작 폴더를 차례로 묻고 그 폴더에서 엽니다.'
+    S_NEWSHELL_DESC='  새 셸로 진입합니다.'
+  else
+    S_WORKING='working'; S_NEEDS='needs you'; S_ASKING='asking'; S_TYPING='typing'
+    S_IDLE='idle';       S_DORMANT='dormant'; S_SHELL='shell';   S_OTHER='other'
+    S_TITLE='tmux sessions'; S_NONE='no sessions'; S_WATCH='attention'
+    S_NEWSESS='New session'; S_NEWSHELL='New shell'
+    S_WIN='win'; S_ATTACHED='attached'; S_DETACHED='detached'
+    S_REFRESH='refresh'; S_QUIT='Ctrl-C to quit'
+    S_KEYS='⏎ attach   ^n new   ^t retag   ^x kill   ^r reload'
+    S_BORDER=' ⬢ tmux sessions '; S_PREVIEW=' preview '
+    S_TAG_HEADER='Pick or type a tag (required)'; S_TAG_PROMPT='tag (required): '
+    S_DIR_HEADER='Pick a start folder (Esc → home)'; S_DIR_PROMPT='dir [~]: '
+    S_NAME_PROMPT=' session name [main]: '
+    S_LAUNCH_PROMPT='Launch  [1] claude  [2] codex  [3] shell  (default 1): '
+    S_NEW_DESC=$'  ＋ Create a new session\n\n  Enter → asks for tag · name · tool (claude/codex/shell)\n  · start folder, then opens there.'
+    S_NEWSHELL_DESC='  Drop into a new shell.'
+  fi
+  # Column width for the status label = widest label (+1), measured in cells.
+  local lbl w; LABELW=4
+  for lbl in "$S_WORKING" "$S_NEEDS" "$S_ASKING" "$S_TYPING" "$S_IDLE" "$S_DORMANT" "$S_SHELL"; do
+    dwidth "$lbl"; [ "$DW" -gt "$LABELW" ] && LABELW="$DW"
+  done
+  LABELW=$(( LABELW + 1 ))
+}
+
+# Relative age from epoch+now.  now / 5m / 3h / 2d / 4w  (ko: 방금/5분/…)
+age_str() {
+  local a="$1" now="$2" d
+  case "$a" in ''|*[!0-9]*) printf '·'; return ;; esac
+  d=$(( now - a ))
+  if [ "$AMUX_LANG" = ko ]; then
+    if   [ "$d" -lt 60 ];     then printf '방금'
+    elif [ "$d" -lt 3600 ];   then printf '%d분'  $(( d / 60 ))
+    elif [ "$d" -lt 86400 ];  then printf '%d시간' $(( d / 3600 ))
+    elif [ "$d" -lt 604800 ]; then printf '%d일'  $(( d / 86400 ))
+    else                           printf '%d주'  $(( d / 604800 )); fi
+  else
+    if   [ "$d" -lt 60 ];     then printf 'now'
+    elif [ "$d" -lt 3600 ];   then printf '%dm' $(( d / 60 ))
+    elif [ "$d" -lt 86400 ];  then printf '%dh' $(( d / 3600 ))
+    elif [ "$d" -lt 604800 ]; then printf '%dd' $(( d / 86400 ))
+    else                           printf '%dw' $(( d / 604800 )); fi
+  fi
+}
+last_activity_str() {   # "$1" already age-formatted
+  [ "$AMUX_LANG" = ko ] && printf '마지막 활동 %s 전' "$1" || printf 'last activity %s ago' "$1"
+}
+n_sessions() {
+  [ "$AMUX_LANG" = ko ] && printf '%s개 세션' "$1" || printf '%s sessions' "$1"
+}
+
+# ---- responsive helpers -----------------------------------------------------
+# Visible terminal width.  Reads the controlling terminal directly (via
+# /dev/tty) so it stays correct even inside $(...) where stdout is a pipe.
+term_cols() {
+  local sz c
+  sz=$( { stty size </dev/tty; } 2>/dev/null )   # "rows cols"
+  c=${sz##* }
+  case "$c" in ''|*[!0-9]*) c=$(tput cols 2>/dev/null) ;; esac
+  case "$c" in ''|*[!0-9]*) c="${COLUMNS:-80}" ;; esac
+  printf '%s' "$c"
+}
+# A run of '─' exactly N cells wide (bash substring is char-aware → cell-accurate).
+HRMAX=$(printf '%200s' '' | sed 's/ /─/g')
+hr() { local w="${1:-80}"; [ "$w" -gt 200 ] && w=200; printf '%s' "${HRMAX:0:$w}"; }
+SP='                    '   # 20 spaces, sliced for fork-free padding
+
+# Display width in terminal cells (CJK/Hangul count as 2) -> sets global DW.
+# Pure bash, no fork: ${#s} is the UTF-8 char count; stripping everything except
+# wide chars leaves the count of double-width chars, which we add on top.
+DW=0
+dwidth() {
+  local wide="${1//[!가-힣ㄱ-ㅎㅏ-ㅣ一-鿿぀-ヿ㐀-䶿！-～]/}"
+  DW=$(( ${#1} + ${#wide} ))
+}
+
+# ---- colors -----------------------------------------------------------------
+C_BUSY=$'\033[33m'      # yellow       - working
+C_BLOCK=$'\033[1;35m'   # bold magenta - needs you (permission/question box)
+C_ASK=$'\033[1;36m'     # bold cyan    - asking (agent asked a question)
+C_DRAFT=$'\033[34m'     # blue         - typing (a draft is in the input box)
+C_IDLE=$'\033[32m'      # green        - idle
+C_PROG=$'\033[36m'      # cyan         - running, activity unknown
+C_DIM=$'\033[90m'       # grey         - shells / chrome
+C_RST=$'\033[0m'
+
+# ---- detection patterns (tunable) ------------------------------------------
+# Markers of an on-screen permission / choice box that blocks the agent.
+RE_BLOCK='Do you want|Would you like to (proceed|continue|create|run)|No, and tell Claude|don.t ask again|keep planning|Yes, and |to confirm( ·| selection)|esc to (cancel|reject)|❯.{1,3}[0-9]+\.|│.{1,3}[0-9]+\. '
+# Markers that the agent's last message is a question ('?' is universal; the
+# rest are common Korean question endings — harmless for other languages).
+RE_ASK='\?|까요|을까|ㄹ까|나요|가요|세요\?|할까|어때|드릴까|여쭤|골라|선택해|알려주(실|세)|괜찮으'
+
+# ---- status detection -------------------------------------------------------
+# Emit one "name<TAB>state<TAB>label<TAB>age" line per *visible* pane
+# (the active pane of the active window in each session).  Runs per-session
+# classification in parallel — that is what keeps picker startup snappy.
+status_table() {
+  local fmt panes ps_snap now
+  fmt="#{?pane_active,1,0}#{?window_active,1,0}${TAB}#{session_name}${TAB}#{pane_pid}${TAB}#{session_activity}${TAB}#{pane_title}"
+  panes=$("${TMUX_CMD[@]}" list-panes -a -F "$fmt" 2>/dev/null) || return 0
+  ps_snap=$(ps -axo ppid=,pid=,command= 2>/dev/null)
+  now=$(date +%s)
+
+  local flags sess pid activity title
+  while IFS="$TAB" read -r flags sess pid activity title; do
+    [ "$flags" = "11" ] || continue
+    printf '%s%s%s%s%s\n' "$sess" "$TAB" \
+      "$(classify "$sess" "$pid" "$title" "$ps_snap" "$activity" "$now")" \
+      "$TAB" "$(age_str "$activity" "$now")" &
+  done <<EOF
+$panes
+EOF
+  wait
+}
+
+# For an idle Claude pane, inspect the screen and decide what it waits on:
+#   block - a permission/question box is up (genuinely blocked)
+#   draft - the input box already has user-typed text
+#   ask   - the agent's last message is a question
+#   quiet - just idle
+wait_kind() {
+  local s="$1" cap bottom promptline draft tail
+  cap=$("${TMUX_CMD[@]}" capture-pane -p -t "$s" 2>/dev/null) || { echo quiet; return; }
+
+  # A real box always sits at the BOTTOM; only scan there so the agent's own
+  # prose (which may quote these phrases) higher up can't false-positive.
+  bottom=$(printf '%s\n' "$cap" | grep -vE '^[[:space:]]*$' | tail -18)
+  if printf '%s\n' "$bottom" | grep -qE "$RE_BLOCK"; then echo block; return; fi
+
+  # last "❯ …" line is the input box. Claude separates ❯ from the text with a
+  # non-breaking space (U+00A0, bytes C2 A0), not a normal space.
+  local nbsp; nbsp=$(printf '\302\240')
+  promptline=$(printf '%s\n' "$cap" | grep -E '^❯' | tail -1)
+  draft=$(printf '%s' "${promptline#❯}" | tr -d " ${nbsp}	")
+  if [ -n "$draft" ]; then echo draft; return; fi
+
+  # strip UI chrome, keep the last message lines, scan for a question
+  tail=$(printf '%s\n' "$cap" \
+    | grep -vE '^[[:space:]]*$' \
+    | grep -vE '^─+$|^❯|^[[:space:]]*📁|^[[:space:]]*⏵⏵|^✻ .*(for|tokens)|^[[:space:]]*※|How is Claude doing|^[[:space:]]*[0-9]: ' \
+    | tail -10)
+  if printf '%s\n' "$tail" | grep -qE "$RE_ASK"; then echo ask; return; fi
+  echo quiet
+}
+
+# classify <session> <pid> <title> <ps_snap> <activity> <now> -> "state<TAB>label"
+classify() {
+  local sess="$1" pid="$2" title="$3" ps_snap="$4" activity="$5" now="$6"
+  local child label act hex stale=0
+
+  child=$(printf '%s\n' "$ps_snap" | awk -v p="$pid" \
+    '$1==p { c=$0; sub(/^[ ]*[0-9]+[ ]+[0-9]+[ ]+/,"",c); print c; exit }')
+
+  case "$child" in
+    '')          label="" ;;                          # nothing but the shell
+    *[Cc]laude*) label="claude" ;;
+    *codex*)     label="codex" ;;
+    *) label="${child%% *}"; label="${label##*/}" ;;  # bare program name
+  esac
+
+  if [ -z "$label" ]; then printf 'shell\tshell'; return; fi
+
+  # No chat output for ≥ AMUX_DORMANT_DAYS days → dormant candidate.
+  if [ -n "$activity" ] && [ -n "$now" ] && [ "$activity" -eq "$activity" ] 2>/dev/null; then
+    [ "$(( now - activity ))" -ge "$(( ${AMUX_DORMANT_DAYS:-3} * 86400 ))" ] && stale=1
+  fi
+
+  # Claude Code stamps the terminal title with a status glyph:
+  #   braille spinner (U+2800..) -> actively working ; otherwise idle.
+  hex=$(printf '%s' "$title" | LC_ALL=C od -An -tx1 2>/dev/null | tr -d ' \n' | cut -c1-6)
+  case "$hex" in e2a0*|e2a1*|e2a2*|e2a3*) act="busy" ;; *) act="idle" ;; esac
+
+  if [ "$act" = "busy" ]; then printf 'busy\t%s' "$label"; return; fi
+
+  if [ "$label" = "claude" ]; then
+    case "$(wait_kind "$sess")" in
+      block) printf 'block\tclaude' ;;
+      draft) printf 'draft\tclaude' ;;
+      ask)   printf 'ask\tclaude' ;;
+      *)     [ "$stale" = 1 ] && printf 'dormant\tclaude' || printf 'idle\tclaude' ;;
+    esac
+  else
+    [ "$stale" = 1 ] && printf 'dormant\t%s' "$label" || printf 'run\t%s' "$label"
+  fi
+}
+
+# ---- tags & rendering -------------------------------------------------------
+# Each visible tag gets a DISTINCT color by its rank in the sorted tag list, so
+# neighbouring groups never share a color.  Arrays are built once per process;
+# watch_loop resets TAG_ORDER each frame to pick up new tags.
+TAG_ORDER=""; MAXTAG=3; TAG_LIST=(); TAG_C=(); TIDX=0; CHIP=""
+ensure_tag_order() {
+  [ -n "$TAG_ORDER" ] && return
+  TAG_ORDER=$( { existing_tags; printf 'other\n'; } | grep -v '^$' | LC_ALL=C sort -u )
+  local t i=0 pal=(39 208 77 170 45 214 141 205 84 209 75 183 220 117 168 156 111 222)
+  TAG_LIST=(); TAG_C=()
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    TAG_LIST+=("$t"); TAG_C+=("${pal[$(( i % ${#pal[@]} ))]}")
+    dwidth "$t"; [ "$DW" -gt "$MAXTAG" ] && MAXTAG="$DW"
+    i=$(( i + 1 ))
+  done <<EOF
+$TAG_ORDER
+EOF
+}
+tag_idx() { local i; TIDX=0; for i in "${!TAG_LIST[@]}"; do [ "${TAG_LIST[$i]}" = "$1" ] && { TIDX=$i; return; }; done; }
+tag_color() { ensure_tag_order; tag_idx "$1"; printf '%s' "${TAG_C[$TIDX]:-39}"; }
+# Colored chip -> sets global CHIP.  Bold dark text on a filled bg, padded to a
+# uniform display width (MAXTAG) so every chip is the same size → columns align.
+tag_chip() {
+  ensure_tag_order
+  local t="${1:-other}" pad
+  dwidth "$t"; pad=$(( MAXTAG - DW )); [ "$pad" -lt 0 ] && pad=0
+  tag_idx "$t"
+  printf -v CHIP '\033[48;5;%s;1;38;5;16m %s%*s \033[0m' "${TAG_C[$TIDX]:-39}" "$t" "$pad" ''
+}
+chip_cells() { ensure_tag_order; printf '%s' $(( MAXTAG + 2 )); }
+
+# pretty <state> <label> <subname> [age] -> sets global PRETTY (assignment only,
+# no fork).  Layout:  <icon>  <label(LABELW)>  [age(6) if AGECOL]  <subname>
+PRETTY=""; AGECOL=1
+pretty() {
+  local state="$1" label="$2" sub="$3" age="$4" ic col txt n pad agecol=""
+  case "$state" in
+    busy)    ic='▸'; col=$C_BUSY;  txt="$S_WORKING" ;;
+    block)   ic='◆'; col=$C_BLOCK; txt="$S_NEEDS" ;;
+    ask)     ic='◇'; col=$C_ASK;   txt="$S_ASKING" ;;
+    draft)   ic='✎'; col=$C_DRAFT; txt="$S_TYPING" ;;
+    idle)    ic='●'; col=$C_IDLE;  txt="$S_IDLE" ;;
+    dormant) ic='○'; col=$C_DIM;   txt="$S_DORMANT" ;;
+    shell)   ic='·'; col=$C_DIM;   txt="$S_SHELL" ;;
+    *)       ic='●'; col=$C_PROG;  txt="$label" ;;
+  esac
+  dwidth "$txt"; n=$(( LABELW - DW )); [ "$n" -lt 0 ] && n=0; pad="${SP:0:$n}"
+  if [ "$AGECOL" = 1 ] && [ -n "$age" ]; then
+    dwidth "$age"; n=$(( 6 - DW )); [ "$n" -lt 0 ] && n=0
+    agecol="${C_DIM}${age}${SP:0:$n}${C_RST}  "
+  fi
+  PRETTY="${col}${ic}  ${txt}${C_RST}${pad}  ${agecol}${sub}"
+}
+
+joined_sessions() {
+  local table; table=$(status_table); [ -n "$table" ] || return 1; printf '%s\n' "$table"
+}
+
+# Order lines by (group, name); ungrouped "other" sessions sort last.
+sort_by_group() {
+  local name state label age
+  while IFS="$TAB" read -r name state label age; do
+    [ -n "$name" ] || continue
+    case "$name" in
+      */*) printf '0%s\t%s\t%s\t%s\t%s\n' "${name%%/*}" "$name" "$state" "$label" "$age" ;;
+      *)   printf '1\t%s\t%s\t%s\t%s\n'   "$name" "$state" "$label" "$age" ;;
+    esac
+  done | LC_ALL=C sort | cut -f2-
+}
+# Float sessions that need you (block→ask→draft) to the very top, then by group.
+sort_attention() {
+  local name state label age prio g
+  while IFS="$TAB" read -r name state label age; do
+    [ -n "$name" ] || continue
+    case "$state" in block) prio=0 ;; ask) prio=1 ;; draft) prio=2 ;; *) prio=5 ;; esac
+    case "$name" in */*) g="0${name%%/*}" ;; *) g='1' ;; esac
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$prio" "$g" "$name" "$state" "$label" "$age"
+  done | LC_ALL=C sort | cut -f3-
+}
+
+# Render rows grouped under colored tag chips (stdin: name<TAB>state<TAB>label<TAB>age).
+render_groups() {
+  local sorted counts name state label g cur="" cnt sub age
+  sorted=$(sort_by_group)
+  counts=$(printf '%s\n' "$sorted" | awk -F"$TAB" \
+    '{ t=$1; if (t ~ /\//) sub(/\/.*/,"",t); else t="other"; c[t]++ }
+     END { for (k in c) print c[k] "\t" k }')
+  while IFS="$TAB" read -r name state label age; do
+    [ -n "$name" ] || continue
+    case "$name" in */*) g="${name%%/*}"; sub="${name#*/}" ;; *) g="other"; sub="$name" ;; esac
+    if [ "$g" != "$cur" ]; then
+      [ -n "$cur" ] && printf '\n'
+      cnt=$(printf '%s\n' "$counts" | awk -F"$TAB" -v g="$g" '$2==g{print $1}')
+      tag_chip "$g"
+      printf '  %s %s(%s)%s\n' "$CHIP" "$C_DIM" "${cnt:-0}" "$C_RST"
+      cur="$g"
+    fi
+    pretty "$state" "$label" "$sub" "$age"
+    printf '    %s\n' "$PRETTY"
+  done <<EOF
+$sorted
+EOF
+}
+
+# One-line tally of states.  Full labels when wide; icon+count when narrow.
+summary_bar() {
+  printf '%s\n' "$1" | awk -F"$TAB" -v w="${2:-80}" \
+    -v cb="$C_BUSY" -v cl="$C_BLOCK" -v ca="$C_ASK" -v cd="$C_DRAFT" \
+    -v ci="$C_IDLE" -v cz="$C_DIM" -v cp="$C_PROG" -v r="$C_RST" \
+    -v lw="$S_WORKING" -v ln="$S_NEEDS" -v lk="$S_ASKING" -v lt="$S_TYPING" \
+    -v li="$S_IDLE" -v ld="$S_DORMANT" -v lo="$S_OTHER" '
+    { c[$2]++ }
+    END {
+      other = (c["run"]+0) + (c["shell"]+0)
+      if (w < 72) {
+        printf "%s▸%d%s %s◆%d%s %s◇%d%s %s✎%d%s %s●%d%s %s○%d%s",
+          cb,c["busy"]+0,r, cl,c["block"]+0,r, ca,c["ask"]+0,r, cd,c["draft"]+0,r, ci,c["idle"]+0,r, cz,c["dormant"]+0,r
+        if (other > 0) printf " %s●%d%s", cp, other, r
+      } else {
+        printf "%s▸ %d %s%s    %s◆ %d %s%s    %s◇ %d %s%s    %s✎ %d %s%s    %s● %d %s%s    %s○ %d %s%s",
+          cb,c["busy"]+0,lw,r, cl,c["block"]+0,ln,r, ca,c["ask"]+0,lk,r, cd,c["draft"]+0,lt,r, ci,c["idle"]+0,li,r, cz,c["dormant"]+0,ld,r
+        if (other > 0) printf "    %s● %d %s%s", cp, other, lo, r
+      }
+      printf "\n"
+    }'
+}
+
+# "⚠ attention: …" line listing sessions that need you, if any.
+attention_line() {
+  local names
+  names=$(printf '%s\n' "$1" | awk -F"$TAB" '$2=="block"||$2=="ask"{printf "%s  ", $1}')
+  [ -n "$names" ] && printf '%s⚠ %s%s  %s%s%s\n' "$C_BLOCK" "$S_WATCH" "$C_RST" "$C_ASK" "$names" "$C_RST"
+}
+
+# ---- list (default) ---------------------------------------------------------
+list_grouped() {
+  local joined total cols
+  joined=$(joined_sessions) || { printf '  %s%s%s\n' "$C_DIM" "$S_NONE" "$C_RST"; return 0; }
+  total=$(printf '%s\n' "$joined" | grep -c .)
+  cols=$(term_cols); [ "$cols" -lt 90 ] && AGECOL=0 || AGECOL=1
+  printf '%s ⬢ %s%s%s   %s%s%s\n' "$C_PROG" "$C_RST" "$S_TITLE" "" "$C_DIM" "$(n_sessions "$total")" "$C_RST"
+  summary_bar "$joined" "$cols"
+  attention_line "$joined"
+  printf '%s%s%s\n' "$C_DIM" "$(hr "$cols")" "$C_RST"
+  printf '%s\n' "$joined" | render_groups
+}
+
+# ---- watch / dashboard ------------------------------------------------------
+watch_loop() {
+  ensure_term
+  local interval="${AMUX_WATCH_INTERVAL:-2}" joined total cols
+  trap 'printf "\033[?25h"; exit 0' INT TERM
+  printf '\033[?25l'
+  while :; do
+    TAG_ORDER=""
+    joined=$(joined_sessions)
+    total=$(printf '%s\n' "$joined" | grep -c .)
+    cols=$(term_cols); [ "$cols" -lt 90 ] && AGECOL=0 || AGECOL=1
+    printf '\033[H\033[2J'
+    if [ "$cols" -lt 72 ]; then
+      printf '%s ⬢ %s%s %s · %s · %ss%s\n' "$C_PROG" "$C_RST" "$C_DIM" "$(date '+%H:%M')" "$total" "$interval" "$C_RST"
+    else
+      printf '%s ⬢ %s%s%s   %s   %s%s · %ss %s · %s%s\n' \
+        "$C_PROG" "$C_RST" "$S_TITLE" "" "$(date '+%H:%M:%S')" "$C_DIM" "$(n_sessions "$total")" "$interval" "$S_REFRESH" "$S_QUIT" "$C_RST"
+    fi
+    if [ -n "$joined" ]; then
+      summary_bar "$joined" "$cols"
+      attention_line "$joined"
+      printf '%s%s%s\n' "$C_DIM" "$(hr "$cols")" "$C_RST"
+      printf '%s\n' "$joined" | render_groups
+    else
+      printf '\n  %s%s%s\n' "$C_DIM" "$S_NONE" "$C_RST"
+    fi
+    printf '\033[J'
+    sleep "$interval"
+  done
+}
+
+ensure_term() {
+  case "${TERM:-}" in
+    ""|dumb) export TERM=xterm-256color ;;
+    *) if command -v infocmp >/dev/null 2>&1 && ! infocmp "$TERM" >/dev/null 2>&1; then export TERM=xterm-256color; fi ;;
+  esac
+}
+
+# ---- session creation -------------------------------------------------------
+# Pick a starting directory.  fzf over a shallow scan of $AMUX_DIR_ROOTS, else
+# a readline path prompt.
+pick_dir() {
+  local dir base roots IFS_save
+  roots="${AMUX_DIR_ROOTS:-$HOME}"
+  if command -v fzf >/dev/null 2>&1; then
+    dir=$(
+      { printf '%s\n' "$HOME"
+        IFS_save="$IFS"; IFS=':'
+        for base in $roots; do
+          IFS="$IFS_save"
+          [ -d "$base" ] || continue
+          printf '%s\n' "$base"
+          find "$base" -maxdepth 1 -mindepth 1 -type d ! -name '.*' 2>/dev/null
+        done
+        IFS="$IFS_save"
+      } | sort -u | sed "s#^$HOME#~#" \
+        | fzf --ansi --reverse --no-unicode --prompt 'dir> ' --height 60% \
+              --header "$S_DIR_HEADER" --print-query | tail -1
+    )
+    dir="${dir/#\~/$HOME}"
+  else
+    printf '%s' "$S_DIR_PROMPT"; read -e dir 2>/dev/null || read -r dir
+    dir="${dir/#\~/$HOME}"
+  fi
+  [ -n "$dir" ] && [ -d "$dir" ] && printf '%s' "$dir" || printf '%s' "$HOME"
+}
+
+existing_tags() {
+  "${TMUX_CMD[@]}" list-sessions -F '#{session_name}' 2>/dev/null | sed -n 's#/.*##p' | sort -u
+}
+
+pick_tag() {
+  local tag
+  if command -v fzf >/dev/null 2>&1; then
+    tag=$(existing_tags | fzf --ansi --reverse --no-unicode --print-query \
+            --prompt 'tag> ' --height 40% --header "$S_TAG_HEADER" | tail -1)
+  else
+    printf '%s' "$S_TAG_PROMPT"; read -r tag
+  fi
+  printf '%s' "$tag" | tr -d ' /'
+}
+
+create_session() {
+  local tag name tool cmd dir
+  tag=""; while [ -z "$tag" ]; do tag=$(pick_tag); done
+  printf '[%s]%s' "$tag" "$S_NAME_PROMPT"; read -r name
+  name="${name:-main}"; name="$tag/$name"
+  if "${TMUX_CMD[@]}" has-session -t "$name" 2>/dev/null; then
+    "${TMUX_CMD[@]}" attach-session -t "$name"; return
+  fi
+  printf '%s' "$S_LAUNCH_PROMPT"; read -r tool
+  case "$tool" in 2|codex|c2) cmd="codex" ;; 3|shell|sh|s) cmd="" ;; *) cmd="claude" ;; esac
+  dir=$(pick_dir)
+  "${TMUX_CMD[@]}" new-session -d -s "$name" -c "$dir"
+  [ -n "$cmd" ] && "${TMUX_CMD[@]}" send-keys -t "$name" "$cmd" Enter
+  "${TMUX_CMD[@]}" attach-session -t "$name"
+}
+
+# ---- picker pieces ----------------------------------------------------------
+# fzf --preview target: a bare session name (hidden field {2}).  Adapts to the
+# preview pane size via $FZF_PREVIEW_COLUMNS / $FZF_PREVIEW_LINES.
+preview_line() {
+  local name="$1" meta pw ph head act now
+  pw="${FZF_PREVIEW_COLUMNS:-52}"; ph="${FZF_PREVIEW_LINES:-40}"
+  case "$name" in
+    __new__)   printf '%s%s%s\n' "$C_BUSY" "$S_NEW_DESC" "$C_RST"; return ;;
+    __shell__) printf '%s\n' "$S_NEWSHELL_DESC"; return ;;
+    '')        printf '\n'; return ;;
+  esac
+  act=$("${TMUX_CMD[@]}" display-message -p -t "$name" '#{session_activity}' 2>/dev/null)
+  now=$(date +%s)
+  meta=$("${TMUX_CMD[@]}" display-message -p -t "$name" \
+    "#{session_windows}$S_WIN · #{?session_attached,● $S_ATTACHED,○ $S_DETACHED} · #{pane_current_path}" 2>/dev/null)
+  meta="${meta//$HOME/~}"
+  printf '%s %s%s  %s%s%s\n%s%s%s\n%s%s%s\n' \
+    "$C_BUSY" "$name" "$C_RST" "$C_DIM" "$(last_activity_str "$(age_str "$act" "$now")")" "$C_RST" \
+    "$C_DIM" "$meta" "$C_RST" "$C_DIM" "$(hr "$pw")" "$C_RST"
+  head=$(( ph - 3 )); [ "$head" -lt 5 ] && head=5
+  "${TMUX_CMD[@]}" capture-pane -p -e -t "$name" 2>/dev/null | grep -vE '^[[:space:]]*$' | tail -n "$head"
+}
+
+kill_line() { case "$1" in __new__|__shell__|'') return 0 ;; esac; "${TMUX_CMD[@]}" kill-session -t "$1" 2>/dev/null; }
+
+retag() {
+  case "$1" in __new__|__shell__|'') return 0 ;; esac
+  local name="$1" sub newtag
+  case "$name" in */*) sub="${name#*/}" ;; *) sub="$name" ;; esac
+  newtag=""; while [ -z "$newtag" ]; do newtag=$(pick_tag); done
+  "${TMUX_CMD[@]}" rename-session -t "$name" "$newtag/$sub" 2>/dev/null
+}
+
+run_choice() {
+  case "$1" in
+    ''|__shell__) return 0 ;;
+    __new__) create_session ;;
+    *) "${TMUX_CMD[@]}" attach-session -t "$1" ;;
+  esac
+}
+
+# Each line: "<display>\t<bare name|sentinel>".  fzf shows field 1 (--with-nth 1)
+# and returns field 2 (--accept-nth 2).  No headers/blank rows → no dead lines.
+build_pick_choices() {
+  local include_shell="$1" name state label age cw tag sub
+  cw=$(chip_cells)
+  [ "$(term_cols)" -lt 90 ] && AGECOL=0
+  printf '%*s %s＋ %s%s\t__new__\n' "$cw" '' "$C_BUSY" "$S_NEWSESS" "$C_RST"
+  [ "$include_shell" = "yes" ] && printf '%*s %s· %s%s\t__shell__\n' "$cw" '' "$C_DIM" "$S_NEWSHELL" "$C_RST"
+  joined_sessions 2>/dev/null | sort_attention | while IFS="$TAB" read -r name state label age; do
+    [ -n "$name" ] || continue
+    case "$name" in */*) tag="${name%%/*}"; sub="${name#*/}" ;; *) tag="other"; sub="$name" ;; esac
+    tag_chip "$tag"; pretty "$state" "$label" "$sub" "$age"
+    printf '%s %s\t%s\n' "$CHIP" "$PRETTY" "$name"
+  done
+}
+
+pick_with_fzf() {
+  local include_shell="$1" choice list_cmd portfile refresher
+  list_cmd="\"$SELF\" --pick-list $include_shell"
+  portfile="$(mktemp -t amux.XXXXXX 2>/dev/null || echo "/tmp/amux.$$")"
+  (
+    p=""
+    for _ in $(seq 1 60); do [ -s "$portfile" ] && { p=$(cat "$portfile"); break; }; sleep 0.1; done
+    [ -n "$p" ] || exit 0
+    while sleep "${AMUX_PICK_INTERVAL:-2}"; do
+      curl -s "localhost:$p" -d "refresh-preview" >/dev/null 2>&1 || break
+    done
+  ) &
+  refresher=$!
+  trap 'kill "$refresher" 2>/dev/null; rm -f "$portfile"' RETURN
+  choice="$(
+    eval "$list_cmd" | fzf \
+      --ansi --reverse --cycle \
+      --delimiter "$TAB" --with-nth 1 --accept-nth 2 \
+      --listen 0 --info inline-right --pointer '▌' --ellipsis '' \
+      --border rounded --border-label "$S_BORDER" --border-label-pos 3 \
+      --header-first --header "$S_KEYS" --prompt '  ' \
+      --color 'fg:-1,fg+:255,bg+:236,hl:6,hl+:14,border:240,label:39,prompt:6,pointer:170,header:244,info:240,gutter:-1,preview-border:240' \
+      --preview "\"$SELF\" --preview {2}" \
+      --preview-window 'right,55%,border-left,wrap,<100(down,60%,border-top)' \
+      --preview-label "$S_PREVIEW" \
+      --bind "start:execute-silent(echo \$FZF_PORT > $portfile)" \
+      --bind "ctrl-r:reload($list_cmd)+refresh-preview" \
+      --bind "ctrl-x:execute-silent(\"$SELF\" --kill {2})+reload($list_cmd)" \
+      --bind "ctrl-t:execute(\"$SELF\" --retag {2})+reload($list_cmd)" \
+      --bind "ctrl-n:become(\"$SELF\" --new-attach)" \
+      || true
+  )"
+  run_choice "${choice:-}"
+}
+
+pick_with_numbered_menu() {
+  local include_shell="$1" names=() disp choice selected
+  while IFS="$TAB" read -r disp choice; do
+    [ -n "$choice" ] || continue
+    names+=("$choice"); printf '%2d) %b\n' "${#names[@]}" "$disp"
+  done < <(build_pick_choices "$include_shell")
+  printf '> '; read -r selected
+  case "$selected" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$selected" -ge 1 ] && [ "$selected" -le "${#names[@]}" ] && run_choice "${names[$((selected - 1))]}"
+}
+
+pick_session() {
+  local include_shell="${1:-no}"
+  command -v "${TMUX_CMD[0]}" >/dev/null 2>&1 || return 0
+  ensure_term
+  if command -v fzf >/dev/null 2>&1; then pick_with_fzf "$include_shell"; else pick_with_numbered_menu "$include_shell"; fi
+}
+
+# attach by exact name, else by "<anytag>/<name>" suffix, else open the picker.
+cmd_attach() {
+  local target="$1" match
+  [ -z "$target" ] && { pick_session no; return; }
+  if "${TMUX_CMD[@]}" has-session -t "$target" 2>/dev/null; then
+    "${TMUX_CMD[@]}" attach-session -t "$target"; return
+  fi
+  match=$("${TMUX_CMD[@]}" list-sessions -F '#{session_name}' 2>/dev/null | grep "/$target\$" | head -1)
+  if [ -n "$match" ]; then "${TMUX_CMD[@]}" attach-session -t "$match"
+  else printf 'amux: no session matching "%s"\n' "$target" >&2; return 1; fi
+}
+
+print_help() {
+  if [ "$AMUX_LANG" = ko ]; then
+    cat <<EOF
+amux — 에이전트 인식 tmux 세션 매니저
+
+사용법:
+  amux                 세션 목록 (요약 + 그룹 + 도구/상태)
+  amux watch | -w      실시간 대시보드 (AMUX_WATCH_INTERVAL 초, 기본 2)
+  amux pick  | -p      라이브 미리보기 피커 (선택 세션 실제 화면)
+  amux attach [이름]   이름으로 접속(짧은 이름 매칭), 없으면 피커
+  amux ssh-menu        SSH 로그인용 메뉴 (셸 연동에서 사용)
+  amux --help
+
+피커 단축키:  ⏎ 접속 · ^n 새 세션 · ^t 태그변경 · ^x 종료 · ^r 새로고침
+  · 응답필요·질문함 세션이 맨 위로 정렬됨
+
+태그:  세션명은 "태그/이름" (예: dev/api). 같은 태그는 색상 칩으로 묶임.
+
+상태:  ▸작업중  ◆응답필요  ◇질문함  ✎입력중  ●대기  ○유휴(N일 무활동)
+
+설정(환경변수):
+  AMUX_LANG=en|ko   AMUX_DORMANT_DAYS=3   AMUX_WATCH_INTERVAL=2
+  AMUX_PICK_INTERVAL=2   AMUX_DIR_ROOTS="\$HOME:\$HOME/projects"
+EOF
+  else
+    cat <<EOF
+amux — agent-aware tmux session manager
+
+Usage:
+  amux                 list sessions (summary + groups + tool/status)
+  amux watch | -w      live dashboard (AMUX_WATCH_INTERVAL secs, default 2)
+  amux pick  | -p      live picker with a real-screen preview
+  amux attach [name]   attach by name (short-name match), else open picker
+  amux ssh-menu        login menu (used by the shell integration)
+  amux --help
+
+Picker keys:  ⏎ attach · ^n new · ^t retag · ^x kill · ^r reload
+  · sessions that need you (needs-you / asking) float to the top
+
+Tags:  session names are "tag/name" (e.g. dev/api). Same tag = colored chip.
+
+States:  ▸working ◆needs-you ◇asking ✎typing ●idle ○dormant(N days quiet)
+
+Config (env):
+  AMUX_LANG=en|ko   AMUX_DORMANT_DAYS=3   AMUX_WATCH_INTERVAL=2
+  AMUX_PICK_INTERVAL=2   AMUX_DIR_ROOTS="\$HOME:\$HOME/projects"
+EOF
+  fi
+}
+
+# ---- entrypoint -------------------------------------------------------------
+if [ "${BASH_SOURCE[0]}" != "${0}" ]; then return 0 2>/dev/null || true; fi
+
+load_strings
+
+case "${1:-}" in
+  ''|list|ls)            list_grouped ;;
+  pick|-p|--pick)        pick_session no ;;
+  watch|-w|--watch)      watch_loop ;;
+  attach|a)              shift; cmd_attach "${1:-}" ;;
+  ssh-menu|--ssh-start)
+    if { [ -z "${SSH_TTY:-}" ] && [ -z "${SSH_CONNECTION:-}" ] && [ -z "${SSH_CLIENT:-}" ] && [ -z "${REMOTEHOST:-}" ]; } || [ -n "${TMUX:-}" ]; then exit 0; fi
+    [ -t 0 ] || exit 0
+    pick_session yes ;;
+  --pick-list)           build_pick_choices "${2:-no}" ;;
+  --preview)             shift; preview_line "$*" ;;
+  --kill)                shift; kill_line "$*" ;;
+  --retag)               shift; retag "$*" ;;
+  --new-attach)          create_session ;;
+  -h|--help|help)        print_help ;;
+  *)                     cmd_attach "$1" ;;   # `amux 3d` → attach short name
+esac
