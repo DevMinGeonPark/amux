@@ -471,7 +471,12 @@ create_session() {
     "${TMUX_CMD[@]}" attach-session -t "$name"; return
   fi
   printf '%s' "$S_LAUNCH_PROMPT"; read -r tool
-  case "$tool" in 2|codex|c2) cmd="codex" ;; 3|shell|sh|s) cmd="" ;; *) cmd="claude" ;; esac
+  # New agent sessions launch in unattended ("yolo") mode by default so they run
+  # without stopping for permission/approval prompts.  Override via env to taste,
+  # e.g. AMUX_CLAUDE_CMD='claude' for the normal interactive mode.
+  : "${AMUX_CLAUDE_CMD:=claude --dangerously-skip-permissions}"
+  : "${AMUX_CODEX_CMD:=codex --dangerously-bypass-approvals-and-sandbox}"
+  case "$tool" in 2|codex|c2) cmd="$AMUX_CODEX_CMD" ;; 3|shell|sh|s) cmd="" ;; *) cmd="$AMUX_CLAUDE_CMD" ;; esac
   dir=$(pick_dir)
   "${TMUX_CMD[@]}" new-session -d -s "$name" -c "$dir"
   [ -n "$cmd" ] && "${TMUX_CMD[@]}" send-keys -t "$name" "$cmd" Enter

@@ -100,6 +100,11 @@ alias aw='amux watch'
 | `AMUX_WATCH_INTERVAL` | `2` | 대시보드 갱신 주기(초) |
 | `AMUX_PICK_INTERVAL` | `2` | 피커 미리보기 갱신 주기(초) |
 | `AMUX_DIR_ROOTS` | `$HOME` | 시작 폴더 선택 시 스캔할 디렉터리(`:` 구분) |
+| `AMUX_CLAUDE_CMD` | `claude --dangerously-skip-permissions` | 새 **claude** 세션에서 실행할 명령 |
+| `AMUX_CODEX_CMD` | `codex --dangerously-bypass-approvals-and-sandbox` | 새 **codex** 세션에서 실행할 명령 |
+
+새 에이전트 세션은 기본적으로 무인("yolo") 모드로 실행되어 권한·승인 프롬프트에서
+멈추지 않습니다. 일반 대화 모드로 쓰려면 예: `AMUX_CLAUDE_CMD='claude'` 로 설정하세요.
 
 상태 감지 정규식은 `bin/amux` 상단(`RE_BLOCK`, `RE_ASK`)에 있습니다 — 에이전트
 프롬프트가 다르면 여기서 조정하세요.

@@ -102,6 +102,12 @@ All via environment variables:
 | `AMUX_WATCH_INTERVAL` | `2` | dashboard refresh interval (seconds) |
 | `AMUX_PICK_INTERVAL` | `2` | picker preview refresh interval (seconds) |
 | `AMUX_DIR_ROOTS` | `$HOME` | `:`-separated dirs scanned when picking a start folder |
+| `AMUX_CLAUDE_CMD` | `claude --dangerously-skip-permissions` | command run for a new **claude** session |
+| `AMUX_CODEX_CMD` | `codex --dangerously-bypass-approvals-and-sandbox` | command run for a new **codex** session |
+
+New agent sessions launch in unattended ("yolo") mode by default, so they run
+without pausing for permission/approval prompts. To use the normal interactive
+mode instead, set e.g. `AMUX_CLAUDE_CMD='claude'`.
 
 The status-detection regexes live at the top of `bin/amux` (`RE_BLOCK`,
 `RE_ASK`) — tweak them if your agent's prompts differ.
