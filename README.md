@@ -105,7 +105,7 @@ All via environment variables:
 | `AMUX_DORMANT_DAYS` | `3` | idle → dormant after N days of no output |
 | `AMUX_WATCH_INTERVAL` | `2` | dashboard refresh interval (seconds) |
 | `AMUX_PICK_INTERVAL` | `2` | picker preview refresh interval (seconds) |
-| `AMUX_DIR_ROOTS` | `$HOME` | `:`-separated dirs scanned when picking a start folder |
+| `AMUX_DIR_ROOTS` | `$HOME` | where the folder browser starts (first `:`-separated entry) |
 | `AMUX_CLAUDE_CMD` | `claude --dangerously-skip-permissions` | command run for a new **claude** session |
 | `AMUX_CODEX_CMD` | `codex --dangerously-bypass-approvals-and-sandbox` | command run for a new **codex** session |
 

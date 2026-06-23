@@ -103,7 +103,7 @@ alias aw='amux watch'
 | `AMUX_DORMANT_DAYS` | `3` | N일 무활동 시 대기 → 유휴 |
 | `AMUX_WATCH_INTERVAL` | `2` | 대시보드 갱신 주기(초) |
 | `AMUX_PICK_INTERVAL` | `2` | 피커 미리보기 갱신 주기(초) |
-| `AMUX_DIR_ROOTS` | `$HOME` | 시작 폴더 선택 시 스캔할 디렉터리(`:` 구분) |
+| `AMUX_DIR_ROOTS` | `$HOME` | 폴더 브라우저 시작 위치(`:` 구분 중 첫 항목) |
 | `AMUX_CLAUDE_CMD` | `claude --dangerously-skip-permissions` | 새 **claude** 세션에서 실행할 명령 |
 | `AMUX_CODEX_CMD` | `codex --dangerously-bypass-approvals-and-sandbox` | 새 **codex** 세션에서 실행할 명령 |
 

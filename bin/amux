@@ -18,7 +18,7 @@ SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)/$(basename "
 #   AMUX_DORMANT_DAYS   idle→dormant after N days of no chat output (default 3)
 #   AMUX_WATCH_INTERVAL dashboard refresh seconds (default 2)
 #   AMUX_PICK_INTERVAL  picker preview refresh seconds (default 2)
-#   AMUX_DIR_ROOTS      ':'-separated dirs scanned when picking a start folder
+#   AMUX_DIR_ROOTS      where the folder browser starts (first ':'-separated entry)
 #                       (default: $HOME)
 amux_default_lang() {
   case "${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}" in
@@ -42,7 +42,9 @@ load_strings() {
     S_KILL_PROMPT='세션 %s 종료할까요? [y/N] '
     S_BORDER=' ⬢ tmux 세션 '; S_PREVIEW=' 미리보기 '
     S_TAG_HEADER='태그 선택 또는 새로 입력 (필수)'; S_TAG_PROMPT='태그(필수): '
-    S_DIR_HEADER='시작 폴더 선택 (Esc → 홈)';       S_DIR_PROMPT='폴더 [~]: '
+    S_DIR_HEADER='폴더 탐색 — Enter 이동 · 위 항목으로 사용/생성 (Esc → 홈)'; S_DIR_PROMPT='폴더 [~]: '
+    S_DIR_USE='✓ 현재 폴더 사용'; S_DIR_NEW='＋ 새 폴더…'; S_DIR_UP='⬆ 상위 폴더 (..)'
+    S_DIR_NEWPROMPT='새 폴더 이름: '
     S_NAME_PROMPT=' 세션 이름 [main]: '
     S_LAUNCH_PROMPT='실행  [1] claude  [2] codex  [3] shell  (기본 1): '
     S_NEW_DESC=$'  ＋ 새 세션 만들기\n\n  Enter → 태그 · 이름 · 도구(claude/codex/shell)\n  · 시작 폴더를 차례로 묻고 그 폴더에서 엽니다.'
@@ -58,7 +60,9 @@ load_strings() {
     S_KILL_PROMPT='Kill session %s? [y/N] '
     S_BORDER=' ⬢ tmux sessions '; S_PREVIEW=' preview '
     S_TAG_HEADER='Pick or type a tag (required)'; S_TAG_PROMPT='tag (required): '
-    S_DIR_HEADER='Pick a start folder (Esc → home)'; S_DIR_PROMPT='dir [~]: '
+    S_DIR_HEADER='Browse — Enter to open · top items use/create (Esc → home)'; S_DIR_PROMPT='dir [~]: '
+    S_DIR_USE='✓ use this folder'; S_DIR_NEW='＋ new folder…'; S_DIR_UP='⬆ up (..)'
+    S_DIR_NEWPROMPT='new folder name: '
     S_NAME_PROMPT=' session name [main]: '
     S_LAUNCH_PROMPT='Launch  [1] claude  [2] codex  [3] shell  (default 1): '
     S_NEW_DESC=$'  ＋ Create a new session\n\n  Enter → asks for tag · name · tool (claude/codex/shell)\n  · start folder, then opens there.'
@@ -421,32 +425,39 @@ ensure_term() {
 }
 
 # ---- session creation -------------------------------------------------------
-# Pick a starting directory.  fzf over a shallow scan of $AMUX_DIR_ROOTS, else
-# a readline path prompt.
+# Pick a starting directory.  A navigable fzf browser: Enter on a subfolder
+# walks into it, the top actions use/create a folder.  Selection is only final
+# when you pick "use this folder", so a stray Enter never commits a wrong path.
+# Without fzf it falls back to a readline path prompt.
 pick_dir() {
-  local dir base roots IFS_save
-  roots="${AMUX_DIR_ROOTS:-$HOME}"
-  if command -v fzf >/dev/null 2>&1; then
-    dir=$(
-      { printf '%s\n' "$HOME"
-        IFS_save="$IFS"; IFS=':'
-        for base in $roots; do
-          IFS="$IFS_save"
-          [ -d "$base" ] || continue
-          printf '%s\n' "$base"
-          find "$base" -maxdepth 1 -mindepth 1 -type d ! -name '.*' 2>/dev/null
-        done
-        IFS="$IFS_save"
-      } | sort -u | sed "s#^$HOME#~#" \
-        | fzf --ansi --reverse --no-unicode --prompt 'dir> ' --height 60% \
-              --header "$S_DIR_HEADER" --print-query | tail -1
-    )
-    dir="${dir/#\~/$HOME}"
-  else
+  local cur sel nn dir
+  cur="${AMUX_DIR_ROOTS%%:*}"; [ -n "$cur" ] && [ -d "$cur" ] || cur="$HOME"
+  if ! command -v fzf >/dev/null 2>&1; then
     printf '%s' "$S_DIR_PROMPT"; read -e dir 2>/dev/null || read -r dir
     dir="${dir/#\~/$HOME}"
+    [ -n "$dir" ] && [ -d "$dir" ] && printf '%s' "$dir" || printf '%s' "$HOME"
+    return
   fi
-  [ -n "$dir" ] && [ -d "$dir" ] && printf '%s' "$dir" || printf '%s' "$HOME"
+  while :; do
+    sel=$(
+      { printf '%s\n%s\n' "$S_DIR_USE" "$S_DIR_NEW"
+        [ "$cur" != "/" ] && printf '%s\n' "$S_DIR_UP"
+        find "$cur" -maxdepth 1 -mindepth 1 -type d ! -name '.*' 2>/dev/null \
+          | sort | sed "s#^$cur/##"
+      } | fzf --ansi --reverse --no-unicode --prompt 'dir> ' --height 70% \
+              --header "$S_DIR_HEADER"$'\n'"  ${cur/#$HOME/~}"
+    ) || { printf '%s' "$HOME"; return; }
+    case "$sel" in
+      "$S_DIR_USE")  printf '%s' "$cur"; return ;;
+      "$S_DIR_UP")   cur="$(dirname "$cur")" ;;
+      "$S_DIR_NEW")
+        printf '%s' "$S_DIR_NEWPROMPT"; read -r nn
+        nn="$(printf '%s' "$nn" | tr -d '/')"
+        [ -n "$nn" ] && mkdir -p "$cur/$nn" 2>/dev/null && cur="$cur/$nn" ;;
+      "")            : ;;
+      *)             [ -d "$cur/$sel" ] && cur="$cur/$sel" ;;
+    esac
+  done
 }
 
 existing_tags() {
