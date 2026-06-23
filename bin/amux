@@ -553,7 +553,10 @@ pick_with_fzf() {
     done
   ) &
   refresher=$!
-  trap 'kill "$refresher" 2>/dev/null; rm -f "$portfile"' RETURN
+  # Drop the refresher from the job table so killing it on exit doesn't make
+  # the shell print a "Terminated: 15" job-control notice.
+  disown "$refresher" 2>/dev/null || true
+  trap 'kill "$refresher" 2>/dev/null; wait "$refresher" 2>/dev/null; rm -f "$portfile"' RETURN
   choice="$(
     eval "$list_cmd" | fzf \
       --ansi --reverse --cycle \
