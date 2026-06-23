@@ -39,6 +39,7 @@ load_strings() {
     S_WIN='창'; S_ATTACHED='연결됨'; S_DETACHED='분리됨'
     S_REFRESH='갱신'; S_QUIT='Ctrl-C 종료'
     S_KEYS='⏎ 접속   ^n 새 세션   ^t 태그변경   ^x 종료   ^r 새로고침'
+    S_KILL_PROMPT='세션 %s 종료할까요? [y/N] '
     S_BORDER=' ⬢ tmux 세션 '; S_PREVIEW=' 미리보기 '
     S_TAG_HEADER='태그 선택 또는 새로 입력 (필수)'; S_TAG_PROMPT='태그(필수): '
     S_DIR_HEADER='시작 폴더 선택 (Esc → 홈)';       S_DIR_PROMPT='폴더 [~]: '
@@ -54,6 +55,7 @@ load_strings() {
     S_WIN='win'; S_ATTACHED='attached'; S_DETACHED='detached'
     S_REFRESH='refresh'; S_QUIT='Ctrl-C to quit'
     S_KEYS='⏎ attach   ^n new   ^t retag   ^x kill   ^r reload'
+    S_KILL_PROMPT='Kill session %s? [y/N] '
     S_BORDER=' ⬢ tmux sessions '; S_PREVIEW=' preview '
     S_TAG_HEADER='Pick or type a tag (required)'; S_TAG_PROMPT='tag (required): '
     S_DIR_HEADER='Pick a start folder (Esc → home)'; S_DIR_PROMPT='dir [~]: '
@@ -508,6 +510,16 @@ preview_line() {
 
 kill_line() { case "$1" in __new__|__shell__|'') return 0 ;; esac; "${TMUX_CMD[@]}" kill-session -t "$1" 2>/dev/null; }
 
+# Interactive kill used by the picker's ^x binding — asks before killing so a
+# stray keypress can't drop a session.
+kill_confirm() {
+  case "$1" in __new__|__shell__|'') return 0 ;; esac
+  local name="$1" ans
+  printf "$S_KILL_PROMPT" "$name"
+  read -r ans || return 0
+  case "$ans" in y|Y|yes|Yes) "${TMUX_CMD[@]}" kill-session -t "$name" 2>/dev/null ;; esac
+}
+
 retag() {
   case "$1" in __new__|__shell__|'') return 0 ;; esac
   local name="$1" sub newtag
@@ -570,7 +582,7 @@ pick_with_fzf() {
       --preview-label "$S_PREVIEW" \
       --bind "start:execute-silent(echo \$FZF_PORT > $portfile)" \
       --bind "ctrl-r:reload($list_cmd)+refresh-preview" \
-      --bind "ctrl-x:execute-silent(\"$SELF\" --kill {2})+reload($list_cmd)" \
+      --bind "ctrl-x:execute(\"$SELF\" --kill-ask {2})+reload($list_cmd)" \
       --bind "ctrl-t:execute(\"$SELF\" --retag {2})+reload($list_cmd)" \
       --bind "ctrl-n:become(\"$SELF\" --new-attach)" \
       || true
@@ -675,6 +687,7 @@ case "${1:-}" in
   --pick-list)           build_pick_choices "${2:-no}" ;;
   --preview)             shift; preview_line "$*" ;;
   --kill)                shift; kill_line "$*" ;;
+  --kill-ask)            shift; kill_confirm "$*" ;;
   --retag)               shift; retag "$*" ;;
   --new-attach)          create_session ;;
   -h|--help|help)        print_help ;;
